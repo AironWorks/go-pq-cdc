@@ -326,6 +326,17 @@ type SnapshotConfig struct {
 	HeartbeatInterval time.Duration      `json:"heartbeatInterval" yaml:"heartbeatInterval"`
 	Enabled           bool               `json:"enabled" yaml:"enabled"`
 	Resnapshot        bool               `json:"resnapshot" yaml:"resnapshot"`
+	// ConsistentSnapshot makes the snapshot/stream boundary exact: the slot's
+	// CREATE_REPLICATION_SLOT exported snapshot is imported by the backfill and
+	// its consistent_point is used as the stream start, so no event is delivered
+	// by both the snapshot and the stream. Required for additive consumers
+	// (e.g. rollup counters); idempotent consumers don't need it.
+	//
+	// Trade-off: keeping the exported snapshot valid holds one walsender
+	// connection open for the whole snapshot (unlike the default path, which
+	// exports via pg_export_snapshot on a normal connection and holds none — see
+	// Issue #56). Leave off unless a consumer needs the exact boundary.
+	ConsistentSnapshot bool `json:"consistentSnapshot" yaml:"consistentSnapshot"`
 }
 
 func (s *SnapshotConfig) Validate() error {
