@@ -347,24 +347,57 @@ func (c *connector) shouldTakeSnapshot(ctx context.Context) bool {
 // 3. Execute: Collect snapshot data
 // This ensures no WAL changes are lost during snapshot execution
 func (c *connector) prepareSnapshotAndSlot(ctx context.Context) error {
+	exact := c.cfg.Snapshot.ConsistentSnapshot
 	return c.retryOperation("snapshot", 3, func(_ int) error {
-		// Phase 1: Create replication slot immediately (CRITICAL - preserves WAL)
+		// Exact mode only: hold the slot's exported snapshot open so the backfill
+		// reads exactly the consistent_point the stream resumes from (overlap-free
+		// boundary for additive consumers). Costs one held walsender for the whole
+		// snapshot. Default mode leaves this off and behaves exactly as before
+		// (pg_export_snapshot on a normal connection, zero walsenders — Issue #56).
+		if exact {
+			c.slot.ReleaseExportedSnapshot(ctx) // drop any export held by a prior attempt
+			c.slot.SetHoldExportedSnapshot(true)
+		}
+
+		// Phase 1: Create replication slot immediately (CRITICAL - preserves WAL;
+		// in exact mode this also exports the consistent snapshot).
 		slotInfo, err := c.slot.Create(ctx)
 		if err != nil {
 			return errors.Wrap(err, "create slot")
 		}
+
+		if exact {
+			// An empty export means the slot already existed (incomplete-snapshot
+			// restart / resnapshot / another consumer): its original export died
+			// with the connection, so there is no consistent snapshot to import.
+			// REFUSE rather than fall back to pg_export_snapshot — that path is
+			// overlap-biased and would double-count for the additive consumers
+			// this mode exists to protect (and re-snapshotting re-emits rows on
+			// top). The operator must drop the slot and clear any partial backfill
+			// for an exact rebuild. (We don't auto-drop: a peer may hold it.)
+			if c.slot.ExportedSnapshotName() == "" {
+				c.slot.ReleaseExportedSnapshot(ctx)
+				return errors.Newf("ConsistentSnapshot: replication slot %q already exists with no fresh "+
+					"exported snapshot; refusing to fall back to a non-exact snapshot (it would double-count "+
+					"for additive consumers). Drop the slot and clear any partial backfill, then restart for "+
+					"an exact rebuild", c.cfg.Slot.Name)
+			}
+			c.snapshotter.SetExternalSnapshot(c.slot.ExportedSnapshotName(), c.slot.ConsistentPoint())
+		}
 		logger.Debug("replication slot created, WAL preserved", "slotName", slotInfo.Name, "restartLSN", slotInfo.RestartLSN.String())
 
-		// Phase 2: Prepare snapshot (capture LSN, create metadata, export snapshot)
+		// Phase 2: Prepare snapshot (create metadata + chunks against the snapshot)
 		err = c.snapshotter.Prepare(ctx, c.cfg.Slot.Name)
 		if err != nil {
+			c.slot.ReleaseExportedSnapshot(ctx)
 			return errors.Wrap(err, "prepare snapshot")
 		}
 		c.stream.OpenFromSnapshotLSN()
 
-		// Phase 3: Execute snapshot (collect data from all chunks)
-		// This may fail if coordinator restarts during execution - retry with backoff
+		// Phase 3: Execute snapshot (workers import the snapshot, read all chunks).
+		// The slot's export connection must stay open for this whole phase.
 		if err := c.executeSnapshotWithRetry(ctx); err != nil {
+			c.slot.ReleaseExportedSnapshot(ctx)
 			// Non-recoverable error
 			if c.isSnapshotInvalidationError(err) {
 				log.Fatal(err)
@@ -372,6 +405,8 @@ func (c *connector) prepareSnapshotAndSlot(ctx context.Context) error {
 			return errors.Wrap(err, "execute snapshot")
 		}
 
+		// Snapshot read complete — release the held export connection.
+		c.slot.ReleaseExportedSnapshot(ctx)
 		logger.Info("snapshot completed successfully")
 		return nil
 	})

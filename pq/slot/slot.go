@@ -38,6 +38,19 @@ type Slot struct {
 	cfg             Config
 	mu              sync.Mutex
 	closed          atomic.Bool
+
+	// Exact snapshot export. When holdExportedSnapshot is set (snapshot-enabled
+	// pipelines), Create keeps the replication connection that ran
+	// CREATE_REPLICATION_SLOT open and idle so the snapshot it exported stays
+	// importable (SET TRANSACTION SNAPSHOT) by the snapshotter's workers. The
+	// returned consistent_point is the exact boundary: the backfill reads state
+	// at it and streaming starts from it, so neither overlaps nor drops events.
+	// Releasing the connection (ReleaseExportedSnapshot) invalidates the export,
+	// so it must stay open for the whole snapshot phase.
+	heldReplicationConn  pq.Connection
+	exportedSnapshotName string
+	consistentPoint      pq.LSN
+	holdExportedSnapshot bool
 }
 
 func NewSlot(replicationDSN, standardDSN string, cfg Config, m metric.Metric, updater XLogUpdater) *Slot {
@@ -95,13 +108,19 @@ func (s *Slot) createSlotWithReplicationConn(ctx context.Context) error {
 	if err := s.replicationConn.Connect(ctx); err != nil {
 		return errors.Wrap(err, "slot replication connect")
 	}
+	// When holding the exported snapshot we must NOT close (or run any further
+	// command on) this connection — doing so invalidates the export. It's
+	// released by ReleaseExportedSnapshot once the snapshot phase is done.
+	closeConn := true
 	defer func() {
-		_ = s.replicationConn.Close(ctx)
+		if closeConn {
+			_ = s.replicationConn.Close(ctx)
+		}
 	}()
 
 	sql := fmt.Sprintf("CREATE_REPLICATION_SLOT %s LOGICAL pgoutput", s.cfg.Name)
 	resultReader := s.replicationConn.Exec(ctx, sql)
-	_, err := resultReader.ReadAll()
+	results, err := resultReader.ReadAll()
 	if err != nil {
 		return errors.Wrap(err, "replication slot create result")
 	}
@@ -110,7 +129,99 @@ func (s *Slot) createSlotWithReplicationConn(ctx context.Context) error {
 		return errors.Wrap(err, "replication slot create result reader close")
 	}
 
+	// CREATE_REPLICATION_SLOT returns one row: slot_name, consistent_point,
+	// snapshot_name, output_plugin. consistent_point is the exact LSN the
+	// exported snapshot reflects; the snapshot is importable while this
+	// connection stays open.
+	s.exportedSnapshotName, s.consistentPoint = parseCreateSlotResult(results)
+
+	if s.holdExportedSnapshot && s.exportedSnapshotName != "" {
+		closeConn = false
+		s.heldReplicationConn = s.replicationConn
+		logger.Info("replication slot snapshot exported",
+			"name", s.cfg.Name,
+			"snapshot", s.exportedSnapshotName,
+			"consistentPoint", s.consistentPoint.String())
+	}
+
 	return nil
+}
+
+// SetHoldExportedSnapshot enables keeping the slot-creation replication
+// connection open so the exported snapshot stays importable. Set by the
+// connector for snapshot-enabled pipelines; the default CDC/non-snapshot path
+// leaves it off and Create behaves exactly as before.
+func (s *Slot) SetHoldExportedSnapshot(hold bool) {
+	s.holdExportedSnapshot = hold
+}
+
+// ExportedSnapshotName returns the snapshot exported by the most recent slot
+// creation, or "" if none (e.g. the slot already existed, or holding is off).
+func (s *Slot) ExportedSnapshotName() string {
+	return s.exportedSnapshotName
+}
+
+// ConsistentPoint is the LSN the exported snapshot reflects — the exact
+// backfill/stream boundary.
+func (s *Slot) ConsistentPoint() pq.LSN {
+	return s.consistentPoint
+}
+
+// ReleaseExportedSnapshot closes the held replication connection, invalidating
+// the exported snapshot. Call only after the snapshot phase has finished
+// reading it. No-op if nothing is held.
+func (s *Slot) ReleaseExportedSnapshot(ctx context.Context) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.heldReplicationConn == nil {
+		return
+	}
+	_ = s.heldReplicationConn.Close(ctx)
+	s.heldReplicationConn = nil
+	s.exportedSnapshotName = ""
+}
+
+// Drop removes the replication slot. Used to recreate a fresh consistent
+// snapshot when restarting an incomplete snapshot (the previous export died
+// with its connection). Releases any held export first.
+func (s *Slot) Drop(ctx context.Context) error {
+	s.ReleaseExportedSnapshot(ctx)
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if err := s.conn.Connect(ctx); err != nil {
+		return errors.Wrap(err, "slot connect for drop")
+	}
+	defer func() { _ = s.conn.Close(ctx) }()
+
+	resultReader := s.conn.Exec(ctx, fmt.Sprintf("SELECT pg_drop_replication_slot('%s')", s.cfg.Name))
+	if _, err := resultReader.ReadAll(); err != nil {
+		return errors.Wrap(err, "drop replication slot")
+	}
+	return resultReader.Close()
+}
+
+func parseCreateSlotResult(results []*pgconn.Result) (snapshotName string, consistentPoint pq.LSN) {
+	if len(results) == 0 || len(results[0].Rows) == 0 {
+		return "", 0
+	}
+	result := results[0]
+	for i, fd := range result.FieldDescriptions {
+		if i >= len(result.Rows[0]) {
+			break
+		}
+		switch fd.Name {
+		case "consistent_point":
+			if lsn, err := pq.ParseLSN(string(result.Rows[0][i])); err == nil {
+				consistentPoint = lsn
+			}
+		case "snapshot_name":
+			snapshotName = string(result.Rows[0][i])
+		}
+	}
+	return snapshotName, consistentPoint
 }
 
 func (s *Slot) Info(ctx context.Context) (*Info, error) {

@@ -45,6 +45,27 @@ type Snapshotter struct {
 	orderByMu          sync.RWMutex
 	keepaliveMu        sync.Mutex
 	exportConnClosed   bool
+
+	// External (slot-exported) snapshot. When set, the coordinator imports the
+	// replication slot's snapshot instead of exporting its own via
+	// pg_export_snapshot, and uses the slot's consistent_point as the snapshot
+	// LSN. This makes the backfill/stream boundary exact (no overlap, no gap) —
+	// required for additive consumers. The exporting connection is owned by the
+	// slot, so this Snapshotter holds no export connection in this mode.
+	externalSnapshotID  string
+	externalSnapshotLSN pq.LSN
+	hasExternalSnapshot bool
+}
+
+// SetExternalSnapshot tells the snapshotter to import an already-exported
+// snapshot (from the replication slot) rather than exporting its own. id is the
+// slot's snapshot_name; lsn is its consistent_point. Must be called before
+// Prepare. With it set, the coordinator skips pg_export_snapshot and the
+// boundary is exact.
+func (s *Snapshotter) SetExternalSnapshot(id string, lsn pq.LSN) {
+	s.externalSnapshotID = id
+	s.externalSnapshotLSN = lsn
+	s.hasExternalSnapshot = id != ""
 }
 
 type orderByCacheEntry struct {

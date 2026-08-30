@@ -8,6 +8,7 @@ import (
 	"time"
 
 	cdc "github.com/Trendyol/go-pq-cdc"
+	"github.com/Trendyol/go-pq-cdc/pq"
 	"github.com/Trendyol/go-pq-cdc/pq/message/format"
 	"github.com/Trendyol/go-pq-cdc/pq/publication"
 	"github.com/Trendyol/go-pq-cdc/pq/replication"
@@ -15,112 +16,92 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// TestNoWalsenderDuringSnapshot validates Issue #56 behavior:
-// - During snapshot execution, there should be zero walsender connections
-// - Walsender connections should only exist after snapshot completes
-// - CDC streaming should work normally after snapshot
-func TestNoWalsenderDuringSnapshot(t *testing.T) {
+// walsenderDuringSnapshot runs an initial snapshot and samples, throughout the
+// snapshot, how many walsender connections the slot holds. It returns the max
+// observed and the number of samples taken during the snapshot.
+//
+// The handler updates atomics directly (no buffered channel) so it never
+// backpressures the snapshot — that backpressure is what made the old 100-row
+// version finish inside a single ticker interval and sample zero times. A large
+// bulk-inserted dataset with tiny chunks keeps the snapshot long enough to be
+// sampled many times, making the assertion deterministic.
+func walsenderDuringSnapshot(t *testing.T, slotSuffix string, consistent bool) (maxWalsenders, samples, dataRows int, cdcWorks bool, jobLSN string) {
+	t.Helper()
 	ctx := context.Background()
 
-	// Setup: Create test table with larger dataset for longer snapshot duration
-	tableName := "snapshot_no_walsender_test"
+	tableName := "snapshot_walsender_" + slotSuffix
 	cdcCfg := Config
-	cdcCfg.Slot.Name = "slot_no_walsender"
-	cdcCfg.Publication.Name = "pub_no_walsender"
+	cdcCfg.Slot.Name = "slot_walsender_" + slotSuffix
+	cdcCfg.Publication.Name = "pub_walsender_" + slotSuffix
 	cdcCfg.Publication.Tables = publication.Tables{
-		{
-			Name:            tableName,
-			Schema:          "public",
-			ReplicaIdentity: publication.ReplicaIdentityFull,
-		},
+		{Name: tableName, Schema: "public", ReplicaIdentity: publication.ReplicaIdentityFull},
 	}
 	cdcCfg.Snapshot.Enabled = true
 	cdcCfg.Snapshot.Mode = "initial"
-	cdcCfg.Snapshot.ChunkSize = 25 // Small chunks for longer snapshot duration
+	cdcCfg.Snapshot.ConsistentSnapshot = consistent
+	cdcCfg.Snapshot.ChunkSize = 5 // many small chunks => snapshot spans many samples
+
+	const rowCount = 5000
 
 	postgresConn, err := newPostgresConn()
 	require.NoError(t, err)
+	require.NoError(t, createTestTable(ctx, postgresConn, tableName))
+	require.NoError(t, pgExec(ctx, postgresConn, fmt.Sprintf(
+		"INSERT INTO %s(id, name, age) SELECT g, 'User_'||g, 20+(g%%50) FROM generate_series(1,%d) g",
+		tableName, rowCount)))
 
-	// Create table and insert test data BEFORE snapshot
-	err = createTestTable(ctx, postgresConn, tableName)
-	require.NoError(t, err)
-
-	t.Log("📝 Inserting 100 rows for snapshot test...")
-	for i := 1; i <= 100; i++ {
-		query := fmt.Sprintf("INSERT INTO %s(id, name, age) VALUES(%d, 'User_%d', %d)",
-			tableName, i, i, 20+i%50)
-		err = pgExec(ctx, postgresConn, query)
-		require.NoError(t, err)
-	}
-	t.Log("✅ 100 rows inserted")
-
-	// Setup: Message collection
-	snapshotBeginReceived := false
-	snapshotDataCount := 0
-	snapshotEndReceived := false
-	cdcInsertReceived := false
-
-	// Walsender tracking
-	maxWalsendersDuringSnapshot := 0
-	var snapshotInProgress atomic.Bool
-	stopWalsenderCheck := make(chan struct{})
-	walsenderCheckDone := make(chan struct{})
-
-	messageCh := make(chan any, 200)
-	handlerFunc := func(ctx *replication.ListenerContext) {
-		switch msg := ctx.Message.(type) {
+	var begin, end, cdcInsert atomic.Bool
+	var data atomic.Int64
+	handlerFunc := func(c *replication.ListenerContext) {
+		switch m := c.Message.(type) {
 		case *format.Snapshot:
-			messageCh <- msg
+			switch m.EventType {
+			case format.SnapshotEventTypeBegin:
+				begin.Store(true)
+			case format.SnapshotEventTypeData:
+				data.Add(1)
+			case format.SnapshotEventTypeEnd:
+				end.Store(true)
+			}
 		case *format.Insert:
-			messageCh <- msg
+			cdcInsert.Store(true)
 		}
-		_ = ctx.Ack()
+		_ = c.Ack()
 	}
 
-	// Start connector with snapshot
 	connector, err := cdc.NewConnector(ctx, cdcCfg, handlerFunc)
 	require.NoError(t, err)
-
 	t.Cleanup(func() {
 		connector.Close()
 		postgresConn.Close(ctx)
 		cleanupSnapshotTest(t, ctx, tableName, cdcCfg.Slot.Name, cdcCfg.Publication.Name)
 	})
 
-	// Separate connection for walsender checks
 	checkConn, err := newPostgresConn()
 	require.NoError(t, err)
 	defer checkConn.Close(ctx)
 
-	// Background goroutine to check walsender count during snapshot
+	stop := make(chan struct{})
+	done := make(chan struct{})
 	go func() {
-		defer close(walsenderCheckDone)
-
-		ticker := time.NewTicker(100 * time.Millisecond)
+		defer close(done)
+		ticker := time.NewTicker(25 * time.Millisecond)
 		defer ticker.Stop()
-
 		for {
 			select {
-			case <-stopWalsenderCheck:
+			case <-stop:
 				return
 			case <-ticker.C:
-				if !snapshotInProgress.Load() {
+				if !begin.Load() || end.Load() {
 					continue
 				}
-
 				count, err := countWalsendersForSlot(ctx, checkConn, cdcCfg.Slot.Name)
-				if err != nil {
-					t.Logf("⚠️  Failed to count walsenders: %v", err)
+				if err != nil || end.Load() {
 					continue
 				}
-				if !snapshotInProgress.Load() {
-					continue
-				}
-				if count > maxWalsendersDuringSnapshot {
-					maxWalsendersDuringSnapshot = count
-				}
-				if count > 0 {
-					t.Logf("⚠️  Walsender detected during snapshot: count=%d", count)
+				samples++
+				if count > maxWalsenders {
+					maxWalsenders = count
 				}
 			}
 		}
@@ -128,113 +109,138 @@ func TestNoWalsenderDuringSnapshot(t *testing.T) {
 
 	go connector.Start(ctx)
 
-	waitCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
-	defer cancel()
-	err = connector.WaitUntilReady(waitCtx)
-	require.NoError(t, err)
-
-	// Collect snapshot events
-	timeout := time.After(30 * time.Second)
-	snapshotCompleted := false
-
-	for !snapshotCompleted {
+	deadline := time.After(60 * time.Second)
+	for !end.Load() {
 		select {
-		case msg := <-messageCh:
-			switch m := msg.(type) {
-			case *format.Snapshot:
-				switch m.EventType {
-				case format.SnapshotEventTypeBegin:
-					snapshotBeginReceived = true
-					snapshotInProgress.Store(true)
-					t.Logf("✅ Snapshot BEGIN received, LSN: %s", m.LSN.String())
-				case format.SnapshotEventTypeData:
-					snapshotDataCount++
-					if snapshotDataCount%25 == 0 {
-						t.Logf("📸 Snapshot progress: %d/100 rows received", snapshotDataCount)
-					}
-				case format.SnapshotEventTypeEnd:
-					snapshotEndReceived = true
-					snapshotInProgress.Store(false)
-					snapshotCompleted = true
-					t.Logf("✅ Snapshot END received, LSN: %s", m.LSN.String())
-				}
-			}
-		case <-timeout:
-			t.Fatalf("Timeout waiting for snapshot events. Received %d DATA events", snapshotDataCount)
+		case <-deadline:
+			close(stop)
+			<-done
+			t.Fatalf("timeout waiting for snapshot end; begin=%v data=%d", begin.Load(), data.Load())
+		case <-time.After(20 * time.Millisecond):
 		}
 	}
+	close(stop)
+	<-done
 
-	// Stop walsender checking
-	close(stopWalsenderCheck)
-	<-walsenderCheckDone
-
-	// Wait a bit for CDC to start
-	time.Sleep(500 * time.Millisecond)
-
-	// Check walsender count AFTER snapshot (should exist for CDC streaming)
-	walsenderCountAfterSnapshot, err := countWalsendersForSlot(ctx, checkConn, cdcCfg.Slot.Name)
-	require.NoError(t, err)
-	t.Logf("📊 Walsender count after snapshot: %d", walsenderCountAfterSnapshot)
-
-	// Now insert new data after snapshot (CDC phase)
-	t.Log("📝 Inserting new data for CDC test...")
+	// CDC after snapshot: insert and confirm it streams.
 	for i := 1; i <= 3; i++ {
-		query := fmt.Sprintf("INSERT INTO %s(id, name, age) VALUES(%d, 'CDCUser_%d', %d)",
-			tableName, 1000+i, i, 30)
-		err = pgExec(ctx, postgresConn, query)
-		require.NoError(t, err)
+		require.NoError(t, pgExec(ctx, postgresConn, fmt.Sprintf(
+			"INSERT INTO %s(id, name, age) VALUES(%d, 'CDC_%d', 30)", tableName, 100000+i, i)))
 	}
-
-	// Collect CDC insert event
-	cdcTimeout := time.After(5 * time.Second)
-collectCDC:
-	for {
+	cdcDeadline := time.After(10 * time.Second)
+	for !cdcInsert.Load() {
 		select {
-		case msg := <-messageCh:
-			if _, ok := msg.(*format.Insert); ok {
-				cdcInsertReceived = true
-				t.Log("🔄 CDC INSERT received")
-				break collectCDC
-			}
-		case <-cdcTimeout:
-			t.Log("⚠️  Timeout waiting for CDC INSERT event")
-			break collectCDC
+		case <-cdcDeadline:
+			goto cdcDone
+		case <-time.After(20 * time.Millisecond):
 		}
 	}
+cdcDone:
 
-	// === Assertions ===
+	jobLSN = execScalar(t, ctx, postgresConn,
+		fmt.Sprintf("SELECT snapshot_lsn FROM cdc_snapshot_job WHERE slot_name = '%s'", cdcCfg.Slot.Name))
 
-	t.Run("Verify No Walsender During Snapshot", func(t *testing.T) {
-		assert.Equal(t, 0, maxWalsendersDuringSnapshot,
-			"There should be zero walsender connections during snapshot phase (Issue #56)")
-		t.Logf("✅ Max walsenders during snapshot: %d (expected: 0)", maxWalsendersDuringSnapshot)
+	return maxWalsenders, samples, int(data.Load()), cdcInsert.Load(), jobLSN
+}
+
+// TestNoWalsenderDuringSnapshot validates Issue #56 for the default mode
+// (ConsistentSnapshot off): the snapshot must hold ZERO walsenders, since it
+// exports via pg_export_snapshot on a normal connection.
+func TestNoWalsenderDuringSnapshot(t *testing.T) {
+	const rowCount = 5000
+	maxWal, samples, data, cdcWorks, jobLSN := walsenderDuringSnapshot(t, "default", false)
+
+	require.Greater(t, samples, 0, "walsender count must be sampled at least once during the snapshot")
+	assert.Equal(t, 0, maxWal, "default mode must hold zero walsenders during snapshot (Issue #56)")
+	assert.Equal(t, rowCount, data, "all rows should be captured by the snapshot")
+	assert.True(t, cdcWorks, "CDC streaming should work after snapshot")
+	assert.NotEmpty(t, jobLSN, "snapshot LSN should be recorded")
+	t.Logf("✅ default: maxWalsenders=%d over %d samples (want 0), rows=%d", maxWal, samples, data)
+}
+
+// TestConsistentSnapshotHoldsOneWalsender is the counterpart for the exact mode
+// (ConsistentSnapshot on). The exact boundary requires keeping the slot's
+// exported snapshot open, which holds exactly ONE walsender for the whole
+// snapshot — the documented trade-off against Issue #56.
+func TestConsistentSnapshotHoldsOneWalsender(t *testing.T) {
+	const rowCount = 5000
+	maxWal, samples, data, cdcWorks, jobLSN := walsenderDuringSnapshot(t, "consistent", true)
+
+	require.Greater(t, samples, 0, "walsender count must be sampled at least once during the snapshot")
+	assert.Equal(t, 1, maxWal, "exact mode holds exactly one walsender (the exported snapshot) during snapshot")
+	assert.Equal(t, rowCount, data, "all rows should be captured by the snapshot")
+	assert.True(t, cdcWorks, "CDC streaming should work after snapshot")
+	assert.NotEmpty(t, jobLSN, "snapshot LSN (slot consistent_point) should be recorded")
+	t.Logf("✅ exact: maxWalsenders=%d over %d samples (want 1), rows=%d, snapshotLSN=%s", maxWal, samples, data, jobLSN)
+}
+
+// TestConsistentSnapshotRefusesWhenSlotExists verifies exact mode never
+// silently falls back to a non-exact snapshot. When the slot already exists
+// there is no fresh exported snapshot, and falling back to pg_export_snapshot
+// would double-count for additive consumers — so the connector must refuse
+// (no snapshot completes) rather than proceed. The pre-existing slot here makes
+// the old fall-back path complete a (wrong) snapshot; the fix makes it refuse.
+func TestConsistentSnapshotRefusesWhenSlotExists(t *testing.T) {
+	ctx := context.Background()
+
+	tableName := "snapshot_refuse_test"
+	cdcCfg := Config
+	cdcCfg.Slot.Name = "slot_refuse_exact"
+	cdcCfg.Publication.Name = "pub_refuse_exact"
+	cdcCfg.Publication.Tables = publication.Tables{
+		{Name: tableName, Schema: "public", ReplicaIdentity: publication.ReplicaIdentityFull},
+	}
+	cdcCfg.Snapshot.Enabled = true
+	cdcCfg.Snapshot.Mode = "initial"
+	cdcCfg.Snapshot.ConsistentSnapshot = true
+
+	conn, err := newPostgresConn()
+	require.NoError(t, err)
+	require.NoError(t, createTestTable(ctx, conn, tableName))
+	require.NoError(t, pgExec(ctx, conn, fmt.Sprintf(
+		"INSERT INTO %s(id, name, age) SELECT g, 'n'||g, 20 FROM generate_series(1,50) g", tableName)))
+
+	// Pre-create the slot so the connector can't obtain a fresh exported snapshot.
+	require.NoError(t, pgExec(ctx, conn, fmt.Sprintf(
+		"SELECT pg_create_logical_replication_slot('%s', 'pgoutput')", cdcCfg.Slot.Name)))
+
+	var snapshotEnded atomic.Bool
+	handlerFunc := func(c *replication.ListenerContext) {
+		if m, ok := c.Message.(*format.Snapshot); ok && m.EventType == format.SnapshotEventTypeEnd {
+			snapshotEnded.Store(true)
+		}
+		_ = c.Ack()
+	}
+	connector, err := cdc.NewConnector(ctx, cdcCfg, handlerFunc)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		connector.Close()
+		conn.Close(ctx)
+		cleanupSnapshotTest(t, ctx, tableName, cdcCfg.Slot.Name, cdcCfg.Publication.Name)
 	})
 
-	t.Run("Verify Exactly One Walsender After Snapshot", func(t *testing.T) {
-		assert.Equal(t, 1, walsenderCountAfterSnapshot,
-			"There should be exactly 1 walsender connection after snapshot (stream only, slot uses standard DSN)")
-		t.Logf("✅ Walsender count after snapshot: %d (expected: 1)", walsenderCountAfterSnapshot)
-	})
+	// Start returns once snapshot prepare gives up (it refuses on every retry
+	// because the slot already exists). We wait for that return rather than a
+	// fixed sleep, so teardown doesn't race the still-retrying goroutine.
+	done := make(chan struct{})
+	go func() { connector.Start(ctx); close(done) }()
 
-	t.Run("Verify CDC Streaming Works", func(t *testing.T) {
-		assert.True(t, cdcInsertReceived, "CDC should receive INSERT events after snapshot")
-		t.Log("✅ CDC streaming is working")
-	})
+	select {
+	case <-done:
+	case <-time.After(40 * time.Second):
+		t.Fatal("connector did not stop; exact mode should refuse and return when the slot exists")
+	}
 
-	t.Run("Verify Snapshot Completed", func(t *testing.T) {
-		assert.True(t, snapshotBeginReceived, "Snapshot BEGIN event should be received")
-		assert.True(t, snapshotEndReceived, "Snapshot END event should be received")
-		assert.Equal(t, 100, snapshotDataCount, "Should receive 100 DATA events from snapshot")
+	assert.False(t, snapshotEnded.Load(),
+		"exact mode must refuse when the slot already exists, not silently complete a non-exact snapshot")
+}
 
-		// Query snapshot job metadata
-		query := fmt.Sprintf("SELECT completed FROM cdc_snapshot_job WHERE slot_name = '%s'", cdcCfg.Slot.Name)
-		results, err := execQuery(ctx, postgresConn, query)
-		require.NoError(t, err)
-		require.NotEmpty(t, results)
-
-		completed := string(results[0].Rows[0][0]) == "t"
-		assert.True(t, completed, "Job should be marked as completed")
-
-		t.Logf("✅ Snapshot completed: %t, rows captured: %d", completed, snapshotDataCount)
-	})
+func execScalar(t *testing.T, ctx context.Context, conn pq.Connection, query string) string {
+	t.Helper()
+	results, err := execQuery(ctx, conn, query)
+	require.NoError(t, err)
+	if len(results) == 0 || len(results[0].Rows) == 0 || len(results[0].Rows[0]) == 0 {
+		return ""
+	}
+	return string(results[0].Rows[0][0])
 }

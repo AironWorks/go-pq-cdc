@@ -45,13 +45,21 @@ func (s *Snapshotter) initializeCoordinator(ctx context.Context, slotName string
 		// Fall through to create fresh metadata
 	}
 
-	// IMPORTANT: Export snapshot FIRST, then create chunks within same snapshot view
-	if err := s.exportSnapshotTransaction(ctx); err != nil {
-		return errors.Wrap(err, "export snapshot")
+	// With an external snapshot the replication slot already exported it (and
+	// holds it open); we just import it. Otherwise export our own.
+	if s.hasExternalSnapshot {
+		s.cachedSnapshotID = s.externalSnapshotID
+		logger.Info("[coordinator] using slot-exported snapshot",
+			"snapshot", s.externalSnapshotID, "consistentPoint", currentLSN.String())
+	} else {
+		// IMPORTANT: Export snapshot FIRST, then create chunks within same snapshot view
+		if err := s.exportSnapshotTransaction(ctx); err != nil {
+			return errors.Wrap(err, "export snapshot")
+		}
 	}
 
-	// Create metadata and chunks using the snapshot connection
-	// This guarantees chunk boundaries match the exported snapshot
+	// Create metadata and chunks using a snapshot-consistent connection.
+	// This guarantees chunk boundaries match the snapshot.
 	if err := s.createMetadata(ctx, slotName, currentLSN); err != nil {
 		return errors.Wrap(err, "create metadata")
 	}
@@ -72,10 +80,26 @@ func (s *Snapshotter) createMetadata(ctx context.Context, slotName string, curre
 		Completed:   false,
 	}
 
+	// Chunk boundaries must be computed against the snapshot. With our own
+	// export that's the held export connection; with an external (slot)
+	// snapshot we open a short-lived connection that imports it.
+	chunkConn := s.exportSnapshotConn
+	if s.hasExternalSnapshot {
+		ic, err := s.newSnapshotImportConn(ctx)
+		if err != nil {
+			return errors.Wrap(err, "open snapshot import connection")
+		}
+		defer func() {
+			_ = s.execSQL(ctx, ic, "ROLLBACK")
+			_ = ic.Close(ctx)
+		}()
+		chunkConn = ic
+	}
+
 	// Create chunks for each table using snapshot-consistent connection
 	totalChunks := 0
 	for _, table := range s.tables {
-		chunks := s.createTableChunksWithConn(ctx, s.exportSnapshotConn, slotName, table)
+		chunks := s.createTableChunksWithConn(ctx, chunkConn, slotName, table)
 
 		// Save chunks using batch insert for performance (critical for 100k+ chunks)
 		if err := s.saveChunksBatch(ctx, chunks); err != nil {
@@ -97,6 +121,26 @@ func (s *Snapshotter) createMetadata(ctx context.Context, slotName string, curre
 
 	logger.Info("[coordinator] metadata committed", "totalChunks", totalChunks, "lsn", currentLSN.String())
 	return nil
+}
+
+// newSnapshotImportConn opens a normal connection in a REPEATABLE READ
+// transaction that imports the external (slot-exported) snapshot, so reads on
+// it see exactly the snapshot's state. The caller rolls back and closes it.
+func (s *Snapshotter) newSnapshotImportConn(ctx context.Context) (pq.Connection, error) {
+	conn, err := pq.NewConnection(ctx, s.dsn)
+	if err != nil {
+		return nil, errors.Wrap(err, "create snapshot import connection")
+	}
+	if err := s.execSQL(ctx, conn, "BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ"); err != nil {
+		_ = conn.Close(ctx)
+		return nil, errors.Wrap(err, "begin import transaction")
+	}
+	if err := s.setTransactionSnapshot(ctx, conn, s.externalSnapshotID); err != nil {
+		_ = s.execSQL(ctx, conn, "ROLLBACK")
+		_ = conn.Close(ctx)
+		return nil, errors.Wrap(err, "import snapshot")
+	}
+	return conn, nil
 }
 
 // exportSnapshotTransaction begins a REPEATABLE READ transaction and exports snapshot ID
@@ -227,9 +271,16 @@ func (s *Snapshotter) setupJob(ctx context.Context, slotName, instanceID string)
 	}
 
 	if lockAcquired {
-		currentLSN, err := s.getCurrentLSN(ctx)
-		if err != nil {
-			return false, errors.Wrap(err, "get current LSN")
+		// With an external (slot-exported) snapshot the boundary LSN is the
+		// slot's consistent_point, not a freshly-read WAL position — that's what
+		// makes the backfill exactly disjoint from the stream.
+		currentLSN := s.externalSnapshotLSN
+		if !s.hasExternalSnapshot {
+			lsn, err := s.getCurrentLSN(ctx)
+			if err != nil {
+				return false, errors.Wrap(err, "get current LSN")
+			}
+			currentLSN = lsn
 		}
 
 		logger.Debug("[snapshot] elected as coordinator", "instanceID", instanceID)
